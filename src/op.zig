@@ -6,49 +6,151 @@ pub const Op = struct {
     addressing_mode: AddressingMode,
 
     pub fn init(cpu: *Cpu) ?Op {
-        return opcode_table[cpu.read_and_bump_pc(u8)];
+        return opcode_table[cpu.readAndBumpPc(u8)];
     }
 
     pub fn run(self: Op, cpu: *Cpu) void {
-        const Input = union(enum) {
-            addr: u16,
-            offset: i8,
-            value: u8,
+        const operand: Operand = switch (self.addressing_mode) {
+            .zero_page => Operand{ .addr = cpu.readAndBumpPc(u8) },
+            .zero_page_x => Operand{ .addr = cpu.readAndBumpPc(u8) +% cpu.x },
+            .zero_page_x_ind => Operand{ .addr = cpu.read(u16, cpu.readAndBumpPc(u8) +% cpu.x) },
+            .zero_page_ind_y => Operand{ .addr = cpu.read(u16, cpu.readAndBumpPc(u8)) +% cpu.y },
+            .absolute => Operand{ .addr = cpu.readAndBumpPc(u16) },
+            .absolute_x => Operand{ .addr = cpu.readAndBumpPc(u16) +% cpu.x },
+            .absolute_y => Operand{ .addr = cpu.readAndBumpPc(u16) +% cpu.y },
+            .relative => Operand{ .offset = cpu.readAndBumpPc(i8) },
+            .indirect => Operand{ .addr = cpu.read(u16, cpu.readAndBumpPc(u16)) },
+            .immediate => Operand{ .value = cpu.readAndBumpPc(u8) },
+            .accumulator => Operand{ .accumulator = void{} },
+            .implicit => Operand{ .none = void{} },
         };
 
-        const input: ?Input = switch (self.addressing_mode) {
-            .zero_page => Input{ .addr = cpu.read_and_bump_pc(u8) },
-            .zero_page_x => Input{ .addr = cpu.read_and_bump_pc(u8) +% cpu.x },
-            .zero_page_x_ind => Input{ .addr = cpu.read(u16, cpu.read_and_bump_pc(u8) +% cpu.x) },
-            .zero_page_ind_y => Input{ .addr = cpu.read(u16, cpu.read_and_bump_pc(u8)) +% cpu.y },
-            .absolute => Input{ .addr = cpu.read_and_bump_pc(u16) },
-            .absolute_x => Input{ .addr = cpu.read_and_bump_pc(u16) +% cpu.x },
-            .absolute_y => Input{ .addr = cpu.read_and_bump_pc(u16) +% cpu.y },
-            .relative => Input{ .offset = cpu.read_and_bump_pc(i8) },
-            .indirect => Input{ .addr = cpu.read(u16, cpu.read_and_bump_pc(u16)) },
-            .immediate => Input{ .value = cpu.read_and_bump_pc(u8) },
-            .accumulator => Input{ .value = cpu.a },
-            .implicit => null,
-        };
-
-        // TODO: set flag bits
         switch (self.opcode) {
-            .ora => cpu.a |= switch (input.?) {
-                .addr => |a| cpu.read(u8, a),
-                .value => |v| v,
-                else => unreachable,
-            },
-            .and_ => cpu.a &= cpu.read(u8, input.?.addr),
-            .eor => cpu.a ^= cpu.read(u8, input.?.addr),
+            .ora => cpu.setA(cpu.a | operand.readFrom(u8, cpu)),
+            .and_ => cpu.setA(cpu.a & operand.readFrom(u8, cpu)),
+            .eor => cpu.setA(cpu.a ^ operand.readFrom(u8, cpu)),
             .adc => {
-                // It's MUCH more complicated than this.
-                cpu.a += cpu.read(u8, input.?.addr);
+                // TODO: It's MUCH more complicated than this.
+                cpu.a += operand.readFrom(u8, cpu);
+                cpu.updateNZFlags(cpu.a);
             },
-            .sta => cpu.write(u8, input.?.addr, cpu.a),
-            .lda => cpu.a = cpu.read(u8, input.?.addr),
             .cmp => unreachable,
             .sbc => unreachable,
-            else => unreachable,
+            .cpx => unreachable,
+            .cpy => unreachable,
+
+            .asl => {
+                const new, const overflow = @shlWithOverflow(operand.readFrom(u8, cpu), 1);
+
+                operand.writeTo(u8, cpu, new);
+                cpu.updateNZFlags(new);
+                cpu.flags.carry = overflow != 0;
+            },
+            .rol => {
+                var new, const overflow = @shlWithOverflow(operand.readFrom(u8, cpu), 1);
+                new |= @intFromBool(cpu.flags.carry);
+
+                operand.writeTo(u8, cpu, new);
+                cpu.updateNZFlags(new);
+                cpu.flags.carry = overflow != 0;
+            },
+            .lsr => {
+                // There's no @shrWithOverflow :(
+                var new = operand.readFrom(u8, cpu);
+                const overflow = new & 0b1;
+                new >>= 1;
+
+                operand.writeTo(u8, cpu, new);
+                cpu.updateNZFlags(new);
+                cpu.flags.carry = overflow != 0;
+            },
+            .ror => {
+                var new = operand.readFrom(u8, cpu);
+                const overflow = new & 0b1;
+                new >>= 1;
+                // ugh.
+                const carry: u8 = @intCast(@intFromBool(cpu.flags.carry));
+                new |= carry << 7;
+
+                operand.writeTo(u8, cpu, new);
+                cpu.updateNZFlags(new);
+                cpu.flags.carry = overflow != 0;
+            },
+            .dec => {
+                const new = operand.readFrom(u8, cpu) -% 1;
+                operand.writeTo(u8, cpu, new);
+                cpu.updateNZFlags(new);
+            },
+            .inc => {
+                const new = operand.readFrom(u8, cpu) +% 1;
+                operand.writeTo(u8, cpu, new);
+                cpu.updateNZFlags(new);
+            },
+            .inx => cpu.setX(cpu.x +% 1),
+            .iny => cpu.setY(cpu.y +% 1),
+            .dex => cpu.setX(cpu.x -% 1),
+            .dey => cpu.setY(cpu.y -% 1),
+
+            .bit => {
+                const input = operand.readFrom(u8, cpu);
+                cpu.flags.negative = input & 0b10000000 != 0;
+                cpu.flags.overflow = input & 0b01000000 != 0;
+                cpu.flags.zero = cpu.a & input == 0;
+            },
+            .jmp => cpu.pc = operand.readFrom(u16, cpu),
+
+            .bpl => cpu.branch(!cpu.flags.negative, operand.offset),
+            .bmi => cpu.branch(cpu.flags.negative, operand.offset),
+            .bvc => cpu.branch(!cpu.flags.overflow, operand.offset),
+            .bvs => cpu.branch(cpu.flags.overflow, operand.offset),
+            .bcc => cpu.branch(!cpu.flags.carry, operand.offset),
+            .bcs => cpu.branch(cpu.flags.carry, operand.offset),
+            .bne => cpu.branch(!cpu.flags.zero, operand.offset),
+            .beq => cpu.branch(cpu.flags.zero, operand.offset),
+
+            .php => cpu.saveFlags(true),
+            .plp => cpu.restoreFlags(),
+            .pha => cpu.stackPush(u8, cpu.a),
+            .pla => cpu.setA(cpu.stackPop(u8)),
+
+            .clc => cpu.flags.carry = false,
+            .sec => cpu.flags.carry = true,
+            .cli => cpu.flags.interrupt_disabled = false,
+            .sei => cpu.flags.interrupt_disabled = true,
+            .clv => cpu.flags.overflow = false,
+            .cld => cpu.flags.decimal_mode = false,
+            .sed => cpu.flags.decimal_mode = true,
+
+            .sta => operand.writeTo(u8, cpu, cpu.a),
+            .lda => cpu.setA(operand.readFrom(u8, cpu)),
+            .stx => operand.writeTo(u8, cpu, cpu.x),
+            .ldx => cpu.setX(operand.readFrom(u8, cpu)),
+            .sty => operand.writeTo(u8, cpu, cpu.y),
+            .ldy => cpu.setY(operand.readFrom(u8, cpu)),
+            .txa => cpu.setA(cpu.x),
+            .tax => cpu.setX(cpu.a),
+            .tay => cpu.setY(cpu.a),
+            .tya => cpu.setA(cpu.y),
+            .txs => cpu.sp = cpu.x,
+            .tsx => cpu.setX(cpu.sp),
+
+            .brk => {
+                cpu.stackPush(u16, cpu.pc + 2); // leave space for break marking
+                cpu.saveFlags(true);
+                // Jump to interrupt vector
+                cpu.pc = cpu.read(u16, 0xfffe);
+            },
+            .rti => {
+                cpu.restoreFlags();
+                cpu.pc = cpu.stackPop(u16);
+            },
+            .jsr => {
+                cpu.stackPush(u16, cpu.pc);
+                cpu.pc = operand.readFrom(u16, cpu);
+            },
+            .rts => cpu.pc = cpu.stackPop(u16),
+
+            .nop => {}, // literally nothing
         }
     }
 
@@ -79,6 +181,30 @@ pub const Op = struct {
         try writer.writeAll(op);
         try writer.writeAll(" ");
         try writer.writeAll(am);
+    }
+};
+
+const Operand = union(enum) {
+    addr: u16,
+    value: u8,
+    offset: i8,
+    accumulator: void,
+    none: void,
+
+    fn readFrom(self: Operand, comptime T: type, cpu: *const Cpu) T {
+        return switch (self) {
+            .addr => |a| cpu.read(T, a),
+            .accumulator => @intCast(cpu.a),
+            .value => |v| @intCast(v),
+            else => unreachable,
+        };
+    }
+    fn writeTo(self: Operand, comptime T: type, cpu: *Cpu, value: T) void {
+        return switch (self) {
+            .addr => |a| cpu.write(T, a, value),
+            .accumulator => cpu.a = @intCast(value),
+            else => unreachable,
+        };
     }
 };
 
@@ -134,7 +260,7 @@ const Opcode = enum {
     clc,
     sec,
     cli,
-    sey,
+    sei,
     tya,
     clv,
     cld,
@@ -323,7 +449,7 @@ const opcode_table: [256]?Op = table: {
         .clc,
         .sec,
         .cli,
-        .sey,
+        .sei,
         .tya,
         .clv,
         .cld,
